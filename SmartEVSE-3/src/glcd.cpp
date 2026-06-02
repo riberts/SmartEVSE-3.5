@@ -458,13 +458,48 @@ void GLCDHelp(void)                                                             
 }
 
 
+// print starting time when delayed charging
+#define STRLEN 26
+void printStartingTime(char *Str) {
+    GLCD_print_buf2(2, (const char *) "STARTING @");
+#define _24H 24*60*60
+#define _WEEK 7*_24H
+    String StrFormat;
+    if (DelayedStartTime.diff <= _24H)
+        //if it starts in the next 24 hours, just print hours : minutes
+        StrFormat = "%R";
+    else {
+        //if it starts in the next week, print day of week, day of month, hours: minutes
+        if (DelayedStartTime.diff <= _WEEK)
+            StrFormat = "%a %e %R";
+        else
+        //if it starts later, print day of week, day of month, month, year perhaps scrolling hours/minutes?
+            StrFormat = "%a %e %b";
+            //StrFormat = "%a %e %b '%C %R";
+    }
+    if (DelayedStartTime.epoch2 && LocalTimeSet && DelayedStartTime.epoch2 != DelayedStartTime_Old) {
+        time_t epoch = DelayedStartTime.epoch2 + EPOCH2_OFFSET;
+        DelayedStartTimeTM = *localtime(&epoch);
+    }
+    if (!strftime(Str, STRLEN, StrFormat.c_str(), &DelayedStartTimeTM))
+        sprintf(Str, "later...");
+    GLCD_print_buf2(4, Str);
+    //print current time
+    if (LocalTimeSet) {
+        GLCD_buffer_clr();
+        if (strftime(Str, STRLEN, "%a %e %b '%y %R", &timeinfo))
+            GLCD_write_buf_str(0,0, Str, GLCD_ALIGN_LEFT);
+        GLCD_sendbuf(7, 1);
+    }
+}
+
 // called once a second
 void GLCD(void) {
     unsigned char x;
     unsigned int seconds, minutes;
     static unsigned char energy_mains = 20; // X position
     static unsigned char energy_ev = 74; // X position
-    char Str[26];
+    char Str[STRLEN];
     LCDTimer++;
     
     if (LCDNav) {
@@ -578,7 +613,7 @@ void GLCD(void) {
             } else if (ErrorFlags & CIRCUIT_NOCOMM) {
                 GLCD_print_buf2(0, (const char *) "CAN'T READ");
                 GLCD_print_buf2(2, (const char *) "CIRCUIT METER");
-            } else if (MainsMeter.Type == EM_API || MainsMeter.Type == EM_HOMEWIZARD_P1) {
+            } else if (MainsMeter.Type == EM_API || MainsMeter.Type == EM_HOMEWIZARD) {
                 GLCD_print_buf2(0, (const char *) "CAN'T READ");
                 GLCD_print_buf2(2, (const char *) "MAINS METER");
             } else {
@@ -743,9 +778,12 @@ void GLCD(void) {
                         case ChargePointStatus_Charging:
                         case ChargePointStatus_SuspendedEVSE:
                         case ChargePointStatus_SuspendedEV:
-                            // Should not be reached (Access_bit or STATE_C above prevail)
-                            GLCD_print_buf2(2, (const char *) "CHARGING");
-                            GLCD_print_buf2(4, (const char *) "IN PROGRESS");
+                            if (DelayedStartTime.epoch2) {
+                                printStartingTime(Str);
+                            } else {
+                                GLCD_print_buf2(2, (const char *) "CHARGING");
+                                GLCD_print_buf2(4, (const char *) "IN PROGRESS");
+                            }
                             break;
                         case ChargePointStatus_Finishing:
                             if (ocppLockingTxDefined()) {
@@ -783,36 +821,7 @@ void GLCD(void) {
                     }
                 } else {
                     if (DelayedStartTime.epoch2) {
-                        GLCD_print_buf2(2, (const char *) "STARTING @");
-#define _24H 24*60*60
-#define _WEEK 7*_24H
-                        String StrFormat;
-                        if (DelayedStartTime.diff <= _24H)
-                            //if it starts in the next 24 hours, just print hours : minutes
-                            StrFormat = "%R";
-                        else {
-                            //if it starts in the next week, print day of week, day of month, hours: minutes
-                            if (DelayedStartTime.diff <= _WEEK)
-                                StrFormat = "%a %e %R";
-                            else
-                            //if it starts later, print day of week, day of month, month, year perhaps scrolling hours/minutes?
-                                StrFormat = "%a %e %b";
-                                //StrFormat = "%a %e %b '%C %R";
-                        }
-                        if (DelayedStartTime.epoch2 && LocalTimeSet && DelayedStartTime.epoch2 != DelayedStartTime_Old) {
-                            time_t epoch = DelayedStartTime.epoch2 + EPOCH2_OFFSET;
-                            DelayedStartTimeTM = *localtime(&epoch);
-                        }
-                        if (!strftime(Str, sizeof(Str), StrFormat.c_str(), &DelayedStartTimeTM))
-                            sprintf(Str, "later...");
-                        GLCD_print_buf2(4, Str);
-                        //print current time
-                        if (LocalTimeSet) {
-                            GLCD_buffer_clr();
-                            if (strftime(Str, 26, "%a %e %b '%y %R", &timeinfo))
-                                GLCD_write_buf_str(0,0, Str, GLCD_ALIGN_LEFT);
-                            GLCD_sendbuf(7, 1);
-                        }
+                        printStartingTime(Str);
                     } else {
                         GLCD_print_buf2(2, (const char *) "ACCESS");
                         GLCD_print_buf2(4, (const char *) "DENIED");
@@ -1005,6 +1014,49 @@ void GLCD(void) {
  * @param uint8_t nav
  * @return uint8_t[] MenuItemOption
  */
+static const char *getMeterHostStr(const Meter &meter, uint8_t value) {
+    static char Str[12]; // must be declared static, since it's referenced outside of function scope
+
+    if (value == 0) {
+        if (strlen(meter.DeviceHostName) == 0) return "Not Set";
+        compileServiceName(meter.Type, meter.DeviceHostName, Str, sizeof(Str));
+        if (Str[0] == '\0') return "Not Set";
+        return Str;
+    }
+
+    const mDNSServiceEntry *service = getCompatiblemDNSServiceByIndex(meter.Type, value - 1);
+    if (service && !service->HostName.isEmpty()) {
+        compileServiceName(meter.Type, service->HostName.c_str(), Str, sizeof(Str));
+        if (Str[0] != '\0') {
+            return Str;
+        }
+    }
+    return "Not Set";
+}
+
+/**
+ * Commit the selected host entry for one meter menu.
+ * This only updates the meter that was actually edited, and clears that meter's
+ * pending menu selection so the LCD menu returns to its neutral state.
+ * 
+ * @param Meter &meter
+ * @param uint8_t menu selection index (0 for "Unchanged", 1 for first mDNS entry, etc.)
+ * @return void
+ */
+static void commitMeterHostSelection(Meter &meter, uint8_t value) {
+    // If the user selected "Unchanged", do nothing and just clear the pending menu selection
+    // Else, if they selected an mDNS entry ( value >= 1 ), update the meter's DeviceHostName to match the selected entry
+    if (value >= 1) {
+        const mDNSServiceEntry *service = getCompatiblemDNSServiceByIndex(meter.Type, value - 1);
+        if (service && !service->HostName.isEmpty()) {
+            strncpy(meter.DeviceHostName, service->HostName.c_str(), sizeof(meter.DeviceHostName));
+            meter.DeviceHostName[sizeof(meter.DeviceHostName) - 1] = '\0';
+        }
+    }
+
+    meter.HostMenuSelection = 0;
+}
+
 const char * getMenuItemOption(uint8_t nav) {
     static char Str[12]; // must be declared static, since it's referenced outside of function scope
 
@@ -1097,6 +1149,12 @@ const char * getMenuItemOption(uint8_t nav) {
         case MENU_LCDPIN:
             sprintf(Str, "%04u", value);
             return Str;
+        case MENU_EVMETERHOST:
+            return getMeterHostStr(EVMeter, value);
+        case MENU_MAINSMETERHOST:
+            return getMeterHostStr(MainsMeter, value);
+        case MENU_CIRCUITMETERHOST:
+            return getMeterHostStr(CircuitMeter, value);
         case MENU_MAINSMETERADDRESS:
         case MENU_EVMETERADDRESS:
         case MENU_CIRCUITMETERADDRESS:
@@ -1173,19 +1231,28 @@ uint8_t getMenuItems (void) {
                 if (SB2.SoftwareVer == 0x01 || SB2.SoftwareVer == 0x03) {
                     MenuItems[m++] = MENU_SB2_WIFI;                             // Sensorbox-2 Wifi  0:Disabled / 1:Enabled / 2:Portal
                 }
-            } else if (MainsMeter.Type && MainsMeter.Type != EM_API && MainsMeter.Type != EM_HOMEWIZARD_P1) { // - - ? Other?
+            } else if (MainsMeter.Type && MainsMeter.Type != EM_API && MainsMeter.Type != EM_HOMEWIZARD) { // - - ? Other?
                 MenuItems[m++] = MENU_MAINSMETERADDRESS;                        // - - - Address of Mains electric meter (9 - 247)
+            }
+            if (MainsMeter.Type && MainsMeter.Type == EM_HOMEWIZARD) {                           // - ? EV meter configured?
+                MenuItems[m++] = MENU_MAINSMETERHOST;                      // - - Device hostname selector for EV electric meter (0: current / 1-9 discovered hostnames)
             }
             MenuItems[m++] = MENU_CIRCUITMETER;                                 // - - Type of Circuit electric meter (0: Disabled / Constants EM_*)
             if (CircuitMeter.Type && CircuitMeter.Type != EM_API) {             // - ? Circuit meter configured?
                 MenuItems[m++] = MENU_CIRCUITMETERADDRESS;                      // - - Address of Circuit electric meter (9 - 247)
             }
+            if (CircuitMeter.Type && CircuitMeter.Type == EM_HOMEWIZARD) {                           // - ? EV meter configured?
+                MenuItems[m++] = MENU_CIRCUITMETERHOST;                      // - - Device hostname selector for EV electric meter (0: current / 1-9 discovered hostnames)
+            }
             if (CircuitMeter.Type || LoadBl == 1)                               // old MaxCircuit behaviour without a CircuitMeter present: we will guard the max the Master gives out!
                 MenuItems[m++] = MENU_CIRCUIT;                                          // - Max current of the EVSE circuit (A)
         }
         MenuItems[m++] = MENU_EVMETER;                                          // - Type of EV electric meter (0: Disabled / Constants EM_*)
-        if (EVMeter.Type && EVMeter.Type != EM_API) {                           // - ? EV meter configured?
+        if (EVMeter.Type && EVMeter.Type != EM_API && EVMeter.Type != EM_HOMEWIZARD) {                           // - ? EV meter configured?
             MenuItems[m++] = MENU_EVMETERADDRESS;                               // - - Address of EV electric meter (9 - 247)
+        }
+        if (EVMeter.Type && EVMeter.Type == EM_HOMEWIZARD) {                           // - ? EV meter configured?
+            MenuItems[m++] = MENU_EVMETERHOST;                      // - - Device hostname selector for EV electric meter (0: current / 1-9 discovered hostnames)
         }
         if (LoadBl < 2) {                                                       // - ? Load Balancing Disabled/Master?
             if (MainsMeter.Type == EM_CUSTOM || EVMeter.Type == EM_CUSTOM || CircuitMeter.Type == EM_CUSTOM) { // ? Custom electric meter used?
@@ -1313,11 +1380,23 @@ void GLCDMenu(uint8_t Buttons) {
                         } while (value == EM_UNUSED_SLOT4);
                         setItemValue(LCDNav, value);
                         break;
-                    case MENU_CIRCUITMETER:                                     // do not display the Sensorbox, HomeWizard P1 or unused slots here
-                    case MENU_EVMETER:                                          // do not display the Sensorbox, HomeWizard P1 or unused slots here
+                    case MENU_CIRCUITMETER:                                     // do not display the Sensorbox or unused slots here
+                    case MENU_EVMETER:                                          // do not display the Sensorbox or unused slots here
                         do {
                             value = MenuNavInt(Buttons, value, MenuStr[LCDNav].Min, MenuStr[LCDNav].Max);
-                        } while (value == EM_SENSORBOX || value == EM_HOMEWIZARD_P1 || value == EM_UNUSED_SLOT4);
+                        } while (value == EM_SENSORBOX || value == EM_UNUSED_SLOT4);
+                        setItemValue(LCDNav, value);
+                        break;
+                    case MENU_EVMETERHOST:
+                        value = MenuNavInt(Buttons, value, 0, getCompatiblemDNSServiceCount(EVMeter.Type));
+                        setItemValue(LCDNav, value);
+                        break;
+                    case MENU_MAINSMETERHOST:
+                        value = MenuNavInt(Buttons, value, 0, getCompatiblemDNSServiceCount(MainsMeter.Type));
+                        setItemValue(LCDNav, value);
+                        break;
+                    case MENU_CIRCUITMETERHOST:
+                        value = MenuNavInt(Buttons, value, 0, getCompatiblemDNSServiceCount(CircuitMeter.Type));
                         setItemValue(LCDNav, value);
                         break;
                     case MENU_WIFI:
@@ -1385,6 +1464,15 @@ void GLCDMenu(uint8_t Buttons) {
     } else if (LCDNav > 1 && LCDNav != MENU_OFF && LCDNav != MENU_ON && Buttons == 0x5 && ButtonRelease == 0) {            // Button 2 pressed?
         ButtonRelease = 1;
         if (SubMenu) {                                                          // We are currently in Submenu
+            if (LCDNav == MENU_EVMETERHOST){
+                commitMeterHostSelection(EVMeter, getItemValue(MENU_EVMETERHOST));
+            }
+            if (LCDNav == MENU_MAINSMETERHOST){
+                commitMeterHostSelection(MainsMeter, getItemValue(MENU_MAINSMETERHOST));
+            }
+            if (LCDNav == MENU_CIRCUITMETERHOST){
+                commitMeterHostSelection(CircuitMeter, getItemValue(MENU_CIRCUITMETERHOST));
+            }
             SubMenu = 0;                                                        // Exit Submenu now
             digit = 3;
             uint8_t WIFImode = getItemValue(MENU_WIFI);
@@ -1516,44 +1604,40 @@ void GLCD_init(void) {
 #endif
 }
 
-/**
- * Write header for BMP 1-bit image.
- *
- * @param width Width of the BMP image in pixels
- * @param height Height of the BMP image in pixels
- */
-std::vector<uint8_t> createBMPHeader(const int width, const int height) {
-    const uint32_t rowSize = (width + 31) / 32 * 4;  // Each row must be a multiple of 4 bytes
-    const uint32_t fileSize = 62 /* header bytes*/ + (rowSize * height / 8);
+// 62-byte BMP header for a 1-bit monochrome image of BMP_WIDTH x BMP_HEIGHT.
+// All multi-byte fields are computed from the constants in glcd.h at compile time
+// (the array initializer is fully constexpr), so the resulting bytes live in flash.
+static constexpr uint8_t BMP_HEADER[62] = {
+    'B', 'M',                                          // 'BM' signature
+    (uint8_t)( BMP_IMAGE_SIZE        & 0xFF),          // File size (LE, 4 bytes)
+    (uint8_t)((BMP_IMAGE_SIZE >>  8) & 0xFF),
+    (uint8_t)((BMP_IMAGE_SIZE >> 16) & 0xFF),
+    (uint8_t)((BMP_IMAGE_SIZE >> 24) & 0xFF),
+    0, 0, 0, 0,                                        // Reserved
+    0x3E, 0, 0, 0,                                     // Pixel-data offset = 14 + 40 + 8 = 62
 
-    std::vector<uint8_t> headerVector(fileSize);
-    headerVector = {
-        'B', 'M',                     // 'BM' Signature
-        static_cast<uint8_t>(fileSize & 0xFF),      // Byte 1 (Least Significant Byte)
-        static_cast<uint8_t>(fileSize >> 8 & 0xFF), // Byte 2
-        0x00,                         // Byte 3
-        0x00,                         // Byte 4 (Most Significant Byte)
-        0x00, 0x00, 0x00, 0x00,       // Reserved
-        0x3E, 0x00, 0x00, 0x00,       // Data offset - Header (14) + DIB (40) + Palette (8) 
+    40, 0, 0, 0,                                       // DIB header size
+    (uint8_t)( BMP_WIDTH        & 0xFF),               // Width  (LE, 4 bytes)
+    (uint8_t)((BMP_WIDTH  >>  8) & 0xFF),
+    (uint8_t)((BMP_WIDTH  >> 16) & 0xFF),
+    (uint8_t)((BMP_WIDTH  >> 24) & 0xFF),
+    (uint8_t)( BMP_HEIGHT        & 0xFF),              // Height (LE, 4 bytes)
+    (uint8_t)((BMP_HEIGHT >>  8) & 0xFF),
+    (uint8_t)((BMP_HEIGHT >> 16) & 0xFF),
+    (uint8_t)((BMP_HEIGHT >> 24) & 0xFF),
+    1, 0,                                              // Planes
+    1, 0,                                              // Bits per pixel (1-bit monochrome)
+    0, 0, 0, 0,                                        // No compression
+    0, 0, 0, 0,                                        // Image size (0 OK for uncompressed)
+    0, 0, 0, 0,                                        // X pixels per meter (unused)
+    0, 0, 0, 0,                                        // Y pixels per meter (unused)
+    2, 0, 0, 0,                                        // Number of colors in the palette
+    0, 0, 0, 0,                                        // Important colors
 
-        40, 0, 0, 0,                  // DIB header size 
-        static_cast<uint8_t>(width), 0, 0, 0,       // Width (max 255)
-        static_cast<uint8_t>(height), 0, 0, 0,      // Height (max 255)
-        1, 0,                         // Planes
-        1, 0,                         // Bits per pixel (1-bit monochrome)
-        0, 0, 0, 0,                   // No compression
-        0, 0, 0, 0,                   // Image size (can be 0 for uncompressed)
-        0, 0, 0, 0,                   // X pixels per meter (unused)
-        0, 0, 0, 0,                   // Y pixels per meter (unused)
-        2, 0, 0, 0,                   // Number of colors in the palette (black & white)
-        0, 0, 0, 0,                   // Important colors
-        
-        // Write color palette
-        0xFF, 0xFF, 0xFF, 0x00,       // White (0)
-        0x00, 0x00, 0xFF, 0x00,       // Red (1)
-    };
-    return headerVector;
-}
+    // Color palette
+    0xFF, 0xFF, 0xFF, 0x00,                            // White (0)
+    0x00, 0x00, 0xFF, 0x00,                            // Red   (1)
+};
 
 /**
  * Transposes a 8x8 bit matrix stored in a byte array.
@@ -1580,50 +1664,46 @@ void transpose8x8(const std::array<uint8_t, 8>& input, std::array<uint8_t, 8>& o
 /**
  * Processes GLCD buffer data and converts it into a BMP-formatted image.
  *
- * This function takes a graphical LCD (GLCD) buffer, processes it by transposing
- * 8x8 pixel blocks, and formats the output as a BMP image. The function reads
- * the buffer in chunks of 128 bytes, rearranges the bits for correct rendering,
- * and appends the processed data to a BMP header.
+ * Writes the BMP into a single 1086-byte static buffer (62 B header + 1024 B pixels).
+ * The buffer is reused across calls, so no heap allocations happen per frame --
+ * important because this function runs once per second, per connected LCD-preview websocket client.
  *
- * @return A vector of `uint8_t` containing the BMP-formatted image data.
+ * @param[out] outSize  Set to the total size of the BMP image in bytes (always BMP_IMAGE_SIZE).
+ * @return Pointer to the static buffer holding the BMP image.
  */
-std::vector<uint8_t> createImageFromGLCDBuffer() {
-    constexpr int WIDTH = 128;        // Image width in pixels
-    constexpr int HEIGHT = 64;        // Image height in pixels
+const uint8_t* createImageFromGLCDBuffer(size_t &outSize) {
     constexpr int CHUNK_SIZE = 128;
     constexpr int BLOCK_SIZE = 8;
 
-    // Initialize with BMP header and pre-allocate memory inn the vector.
-    std::vector<uint8_t> imageData = createBMPHeader(WIDTH, HEIGHT);
+    static uint8_t bmpBuf[BMP_IMAGE_SIZE];
+    // Header is constant and lives in flash -- copy once into the working buffer.
+    memcpy(bmpBuf, BMP_HEADER, sizeof(BMP_HEADER));
 
+    uint8_t *out = bmpBuf + sizeof(BMP_HEADER);
+
+    // Walk GLCDbuf2 from end to start in 128-byte chunks, transposing each 8x8 block.
     for (size_t chunkOffset = sizeof(GLCDbuf2); chunkOffset > 0; chunkOffset -= CHUNK_SIZE) {
-        // Calculate chunk boundaries.
-        const size_t start = chunkOffset >= CHUNK_SIZE ? chunkOffset - CHUNK_SIZE : 0;
-        const size_t end = chunkOffset;
+        const uint8_t *chunk = GLCDbuf2 + (chunkOffset - CHUNK_SIZE);
 
-        // Extract chunk.
-        const std::vector<uint8_t> chunk(GLCDbuf2 + start, GLCDbuf2 + end);
-        std::vector<uint8_t> processed(CHUNK_SIZE);
-
-        // Process the 128-byte chunk in groups of 8.
+        // Process the 128-byte chunk in groups of 8 directly into `out`.
         for (int byteIndex = 0; byteIndex < CHUNK_SIZE; byteIndex += BLOCK_SIZE) {
             std::array<uint8_t, BLOCK_SIZE> input{};
             std::array<uint8_t, BLOCK_SIZE> output{};
-            std::copy_n(chunk.begin() + byteIndex, BLOCK_SIZE, input.begin());
+            std::copy_n(chunk + byteIndex, BLOCK_SIZE, input.begin());
 
             transpose8x8(input, output);
 
-            // Distribute transposed bytes into the processed buffer
+            // Distribute transposed bytes interleaved across the 128-byte row.
             const int newByteIndex = byteIndex / BLOCK_SIZE;
             for (int j = 0; j < BLOCK_SIZE; ++j) {
-                processed[newByteIndex + j * (CHUNK_SIZE / BLOCK_SIZE)] = output[j];
+                out[newByteIndex + j * (CHUNK_SIZE / BLOCK_SIZE)] = output[j];
             }
         }
-
-        // Append processed chunk to image data.
-        imageData.insert(imageData.end(), processed.begin(), processed.end());
+        out += CHUNK_SIZE;
     }
-    return imageData;
+
+    outSize = BMP_IMAGE_SIZE;
+    return bmpBuf;
 }
 
 #endif
