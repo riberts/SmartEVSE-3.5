@@ -30,6 +30,9 @@
 #include "main.h"
 #include "glcd.h"
 #include "meter.h"
+#include <map>
+#include <Preferences.h>
+#include <MicroOcpp/Model/ConnectorBase/Notification.h>
 
 // Pin definitions left side ESP32
 #define PIN_TEMP 36
@@ -59,7 +62,6 @@
 #define PIN_LEDR 2
 #define PIN_CPOFF 15
 
-#if SMARTEVSE_VERSION >=30 && SMARTEVSE_VERSION < 40
 #define PIN_LCD_A0_B2 25
 #define PIN_LCD_RST 5
 #define SPI_MOSI 33                                                             // SPI connections to LCD
@@ -74,11 +76,6 @@
 #define GREEN_CHANNEL 3
 #define BLUE_CHANNEL 4
 #define LCD_CHANNEL 5                                                           // LED Backlight LCD
-#else
-#define PIN_LCD_A0_B2 40
-#define PIN_LCD_RST 42
-#include "funconfig.h"
-#endif //SMARTEVSE_VERSION
 
 //extra pin definitions for v3.1
 #define PIN_RCM_FAULT_V31 38
@@ -164,10 +161,10 @@ const struct {
     {"PWR SHARE", "Share Power between multiple SmartEVSEs (2-8)",    0, NR_EVSES, LOADBL},
     {"SWITCH",  "Switch function control on pin SW",                  0, 7, SWITCH},
     {"RCMON",   "Residual Current Monitor on pin RCM",                0, 1, RC_MON},
-    {"RFID",    "RFID reader, learn/remove cards",                    0, 5 + (ENABLE_OCPP ? 1 : 0), RFID_READER},
+    {"RFID",    "RFID reader, learn/remove cards",                    0, 6, RFID_READER},
     {"EV METER","Type of EV electric meter",                          0, (uint16_t) (EMConfigSize / sizeof(EMConfig[0])-1), EV_METER},
     {"EV ADDR", "Address of EV electric meter",                       MIN_EV_METER_ADDRESS, MAX_METER_ADDRESS, EV_METER_ADDRESS},
-    {"EV HST", "Selected hostname or discovered hostname index",      0, 9, 0},
+    {"EV HST", "Partial mDNS hostname of EV electric meter",          0, 9, 1},
 
     // System configuration
     /* LCD,       Desc,                                                 Min, Max, Default */
@@ -181,10 +178,10 @@ const struct {
     {"IMPORT",  "Allow grid power when solar charging (sum of phase)",0, 48, IMPORT_CURRENT},
     {"MAINS MET","Type of mains electric meter",                      0, (uint16_t) (EMConfigSize / sizeof(EMConfig[0])-1), MAINS_METER},
     {"MAINS ADR","Address of mains electric meter",                   MIN_METER_ADDRESS, MAX_METER_ADDRESS, MAINS_METER_ADDRESS},
-    {"MAINS HST", "Selected hostname or discovered hostname index",   0, 9, 0},
+    {"MAINS HST","Partial mDNS hostname of the mains electric meter", 0, 9, 1},
     {"CIRCT MET","Type of circuit electric meter",                    0, (uint16_t) (EMConfigSize / sizeof(EMConfig[0])-1), CIRCUIT_METER},
     {"CIRCT ADR","Address of circuit electric meter",                 MIN_METER_ADDRESS, MAX_METER_ADDRESS, CIRCUIT_METER_ADDRESS},
-    {"CIRCT HST", "Selected hostname or discovered hostname index",   0, 9, 0},
+    {"CIRCT HST","Partial mDNS hostname of circuit electric meter",   0, 9, 1},
     {"BYTE ORD","Byte order of custom electric meter",                0, 3, EMCUSTOM_ENDIANESS},
     {"DATA TYPE","Data type of custom electric meter",                 0, MB_DATATYPE_MAX - 1, EMCUSTOM_DATATYPE},
     {"FUNCTION","Modbus Function of custom electric meter",           3, 4, EMCUSTOM_FUNCTION},
@@ -230,7 +227,6 @@ extern struct DelayedTimeStruct DelayedStartTime;
 
 void read_settings();
 void write_settings(void);
-void request_write_settings(void);
 void setSolarStopTimer(uint16_t Timer);
 void setState(uint8_t NewState);
 void setAccess(AccessStatus_t Access);
@@ -243,7 +239,90 @@ void setMode(uint8_t NewMode) ;
 void BuzzConfirmation(void);
 void BuzzError(void);
 
-#if ENABLE_OCPP && defined(SMARTEVSE_VERSION) //run OCPP only on ESP32
+extern Preferences preferences;
+
+class ShadowPreferences {
+public:
+    // register a live variable; its current value is read at flush time
+    template<typename T> void markUChar (const char* key, T* p) { reg(key, p, &flushUChar<T>);  }
+    template<typename T> void markUShort(const char* key, T* p) { reg(key, p, &flushUShort<T>); }
+    template<typename T> void markULong (const char* key, T* p) { reg(key, p, &flushULong<T>);  }
+    template<typename T> void markBool  (const char* key, T* p) { reg(key, p, &flushBool<T>);   }
+    template<size_t N>   void markString(const char* key, char (*p)[N]) { reg(key, p, &flushCharArray); }
+    void                 markString(const char* key, String* p)         { reg(key, p, &flushString);    }
+
+    void loop(bool force = false) {             // write dirty keys: force=true writes all, else only those past their window
+        uint32_t now = millis();
+        bool opened = false;
+        for (auto& kv : entries) {
+            Entry& e = kv.second;
+            if (e.dirty && (force || (uint32_t)(now - e.lastWrite) >= SETTINGS_WRITE_INTERVAL * 1000UL)) {
+                if (!opened) { prefs.begin("settings", false); opened = true; }
+                e.fn(prefs, kv.first.c_str(), e.ptr);
+                e.lastWrite = now;
+                e.dirty     = false;
+            }
+        }
+        if (opened) prefs.end();
+    }
+
+private:
+    typedef void (*FlushFn)(Preferences&, const char*, const void*);
+    struct Entry {
+        const void* ptr       = nullptr;
+        FlushFn     fn        = nullptr;
+        uint32_t    lastWrite = (uint32_t)0 - SETTINGS_WRITE_INTERVAL * 1000UL;  // "one interval ago" -> a new key writes immediately
+        bool        dirty     = false;          // a write is pending until the window elapses
+    };
+
+    void reg(const char* key, const void* p, FlushFn fn) {
+        Entry& e = entries[key];
+        e.ptr = p; e.fn = fn;
+        uint32_t now = millis();
+        // Write immediately, unless this key was already written within the last interval.
+        if ((uint32_t)(now - e.lastWrite) >= SETTINGS_WRITE_INTERVAL * 1000UL) {
+            Preferences local;                  // local handle: reg() may run in the web-server task,
+            local.begin("settings", false);     // separate from loop() in the main task
+            e.fn(local, key, e.ptr);
+            local.end();
+            e.lastWrite = now;
+            e.dirty     = false;
+        } else {
+            e.dirty = true;                   // rate-limited: defer to loop()
+        }
+    }
+
+    template<typename T> static void flushUChar(Preferences& p, const char* k, const void* v) {
+        uint8_t x = (uint8_t)*static_cast<const T*>(v);
+        if (!p.isKey(k) || p.getUChar(k) != x) p.putUChar(k, x);
+    }
+    template<typename T> static void flushUShort(Preferences& p, const char* k, const void* v) {
+        uint16_t x = (uint16_t)*static_cast<const T*>(v);
+        if (!p.isKey(k) || p.getUShort(k) != x) p.putUShort(k, x);
+    }
+    template<typename T> static void flushULong(Preferences& p, const char* k, const void* v) {
+        uint32_t x = (uint32_t)*static_cast<const T*>(v);
+        if (!p.isKey(k) || p.getULong(k) != x) p.putULong(k, x);
+    }
+    template<typename T> static void flushBool(Preferences& p, const char* k, const void* v) {
+        bool x = (bool)*static_cast<const T*>(v);
+        if (!p.isKey(k) || p.getBool(k) != x) p.putBool(k, x);
+    }
+    static void flushString(Preferences& p, const char* k, const void* v) {
+        const String& x = *static_cast<const String*>(v);
+        if (!p.isKey(k) || p.getString(k) != x) p.putString(k, x);
+    }
+    static void flushCharArray(Preferences& p, const char* k, const void* v) {
+        const char* x = static_cast<const char*>(v);
+        if (!p.isKey(k) || p.getString(k) != x) p.putString(k, x);
+    }
+
+    Preferences prefs;
+    std::map<String, Entry> entries;
+};
+
+extern ShadowPreferences shadowPrefs;
+
 void ocppUpdateRfidReading(const unsigned char *uuid, size_t uuidLen);
 bool ocppIsConnectorPlugged();
 
@@ -251,49 +330,5 @@ bool ocppHasTxNotification();
 MicroOcpp::TxNotification ocppGetTxNotification();
 
 bool ocppLockingTxDefined();
-#endif //ENABLE_OCPP
-
-#if SMARTEVSE_VERSION >= 40
-// Pin definitions
-#define PIN_QCA700X_INT 9           // SPI connections to QCA7000X
-#define PIN_QCA700X_CS 11           // on ESP-S3 with OCTAL flash/PSRAM, GPIO pins 33-37 can not be used!
-#define SPI_MOSI 13
-#define SPI_MISO 12
-#define SPI_SCK 10
-#define PIN_QCA700X_RESETN 45
-
-#define USART_TX 43                 // comm bus to mainboard
-#define USART_RX 44
-
-#define BUTTON1 0                   // Navigation buttons
-//#define BUTTON2 1                   // renamed from prototype!
-#define BUTTON3 2
-
-// New top board
-#define WCH_NRST 8                  // microcontroller program interface
-#define WCH_SWDIO 17                // unconnected!!! pin on 16pin connector is used for LCD power
-#define WCH_SWCLK 18
-
-// Old prototype top board
-//#define WCH_NRST 18                  // microcontroller program interface
-//#define WCH_SWDIO 8
-//#define WCH_SWCLK 17
-
-#define LCD_SDA 38                  // LCD interface
-#define LCD_SCK 39
-#define LCD_LED 41
-#define LCD_CS 1
-
-#define LCD_CHANNEL 5               // PWM channel
-
-// ESP-WCH Communication States
-#define COMM_VER_REQ 1              // Version Reqest           ESP -> WCH
-#define COMM_VER_RSP 2              // Version Response         ESP <- WCH
-#define COMM_CONFIG_SET 3           // Configuration Set        ESP -> WCH
-#define COMM_CONFIG_CNF 4           // Configuration confirm.   ESP <- WCH
-#define COMM_STATUS_REQ 5           // Status Request
-#define COMM_STATUS_RSP 6           // Status Response
-
-#endif //SMARTEVSE_VERSION
 
 #endif

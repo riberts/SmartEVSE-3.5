@@ -93,7 +93,6 @@ extern void StopwebServer(void); //TODO or move over to network.cpp?
 extern void StartwebServer(void); //TODO or move over to network.cpp?
 extern bool handle_URI(struct mg_connection *c, struct mg_http_message *hm,  webServerRequest* request);
 extern uint8_t AutoUpdate;
-extern Preferences preferences;
 extern uint16_t firmwareUpdateTimer;
 
 uint32_t serialnr = 0;
@@ -178,10 +177,20 @@ void MQTTclient_t::connect(void) {
     _LOG_A("MQTT connecting to %s as %s\n", MQTTHost.c_str(), MQTTprefix.c_str());
 
     client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t) ESP_EVENT_ANY_ID, (esp_event_handler_t) mqtt_event_handler, NULL);
+    if (!client) {
+        _LOG_A("MQTT: esp_mqtt_client_init failed (heap: %u)\n", ESP.getFreeHeap());
+        return;
+    }
+    esp_err_t err = esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t) ESP_EVENT_ANY_ID, (esp_event_handler_t) mqtt_event_handler, NULL);
+    if (err != ESP_OK) {
+        _LOG_A("MQTT: esp_mqtt_client_register_event failed: %d\n", err);
+    }
     // Start now if any network interface is connected (WiFi or Ethernet)
     if (NetworkConnected()) {
-        esp_mqtt_client_start(client);
+        err = esp_mqtt_client_start(client);
+        if (err != ESP_OK) {
+            _LOG_A("MQTT: esp_mqtt_client_start failed: %d\n", err);
+        }
     }
 }
 
@@ -374,7 +383,10 @@ void mqtt_smartevse_event_handler(void *handler_args, esp_event_base_t base, int
     }
 }
 
-// Centralized cleanup - prevents race conditions by atomically clearing state before stopping client
+// Centralized cleanup - prevents race conditions by atomically clearing state before stopping client.
+// This only stops the client; it deliberately does NOT destroy it. esp_mqtt_client_stop() blocks until
+// the client task has fully stopped, so the handle is left in a safe, inert state that connect() can
+// cheaply restart later. 
 void MQTTclientSmartEVSE_t::cleanup(bool publishOffline) {
     connected = false;
     MQTTclientSmartEVSE_AppConnected = false;
@@ -384,12 +396,8 @@ void MQTTclientSmartEVSE_t::cleanup(bool publishOffline) {
         esp_mqtt_client_publish(client, (MQTTSmartEVSEprefix + "/connected").c_str(), "offline", 7, 0, 1);
     }
     
-    // Stop and destroy client - esp_mqtt_client_stop may block briefly
     // Note: This must NOT be called from MQTT task context (event handler)
     esp_mqtt_client_stop(client);
-    vTaskDelay(50 / portTICK_PERIOD_MS);  // Allow MQTT task to finish gracefully
-    esp_mqtt_client_destroy(client);
-    client = nullptr;
 }
 
 void MQTTclientSmartEVSE_t::connect(void) {
@@ -397,13 +405,18 @@ void MQTTclientSmartEVSE_t::connect(void) {
         if (MQTTSmartServer) _LOG_A("SmartEVSE MQTT: No private key hash available.\n");
         return;
     }
-    if (ESP.getFreeHeap() < 50000) {
-        _LOG_A("SmartEVSE MQTT: Not enough memory for TLS connection.\n");
+
+    if (client) {
+        // Already initialized from an earlier connect() 
+        connected = false;
+        _LOG_A("SmartEVSE MQTT restarting existing client as %s\n", MQTTSmartEVSEprefix.c_str());
+        esp_err_t err = esp_mqtt_client_start(client);
+        if (err != ESP_OK) {
+            _LOG_A("SmartEVSE MQTT: esp_mqtt_client_start failed: %d (heap: %u)\n", err, ESP.getFreeHeap());
+        }
         return;
     }
-    
-    cleanup();  // Clean up any existing connection first
-    
+
     // Initialize shared prefix (used by all SmartEVSE MQTT functions)
     MQTTSmartEVSEprefix = "SmartEVSE-" + String(serialnr);
     
@@ -422,8 +435,18 @@ void MQTTclientSmartEVSE_t::connect(void) {
     
     _LOG_A("SmartEVSE MQTT connecting as %s (heap: %u)\n", MQTTSmartEVSEprefix.c_str(), ESP.getFreeHeap());
     client = esp_mqtt_client_init(&cfg);
-    esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, (esp_event_handler_t)mqtt_smartevse_event_handler, NULL);
-    esp_mqtt_client_start(client);
+    if (!client) {
+        _LOG_A("SmartEVSE MQTT: esp_mqtt_client_init failed (heap: %u)\n", ESP.getFreeHeap());
+        return;
+    }
+    esp_err_t err = esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, (esp_event_handler_t)mqtt_smartevse_event_handler, NULL);
+    if (err != ESP_OK) {
+        _LOG_A("SmartEVSE MQTT: esp_mqtt_client_register_event failed: %d\n", err);
+    }
+    err = esp_mqtt_client_start(client);
+    if (err != ESP_OK) {
+        _LOG_A("SmartEVSE MQTT: esp_mqtt_client_start failed: %d (heap: %u)\n", err, ESP.getFreeHeap());
+    }
 }
 
 void MQTTclientSmartEVSE_t::disconnect(void) {
@@ -954,6 +977,7 @@ std::array<mDNSServiceEntry, 8> mDNSServices = {};
 HTTPClient* homeWizardHttpClient=nullptr;
 bool homeWizardHttpClientInitialized = false;
 static bool mdnsDiscoveryInProgress = false;            // True when async mDNS task is running
+static bool mdnsDiscoveryHasRun = false;                // True after mDNS discovery has been executed for the current network state
 static unsigned long lastMdnsQueryTime = 0;             // Last time mDNS query was attempted
 static const unsigned long MDNS_RETRY_INTERVAL = 30000; // Retry mDNS discovery every 30 seconds if not found
 
@@ -987,11 +1011,17 @@ static bool appendDiscoveredService(const String &hostname, uint16_t port, const
 /**
  * @brief Clear the cached mDNS discovery table.
  */
-static void clearmDNSServices() {
+void clearmDNSServices() {
     for (auto &service : mDNSServices) {
         service.ServiceType = 0;
         service.HostName = "";
     }
+    mdnsDiscoveryHasRun = false;
+    lastMdnsQueryTime = 0;
+}
+
+bool isMDNSDiscoveryInProgress(void) {
+    return mdnsDiscoveryInProgress;
 }
 
 /**
@@ -1198,6 +1228,7 @@ void mdnsDiscoveryTask(void* parameter) {
         _LOG_A("No matching mDNS services found.\n");
     }
 
+    mdnsDiscoveryHasRun = true;
     mdnsDiscoveryInProgress = false;
     _LOG_A("mDNS discovery task completed\n");
     vTaskDelete(NULL);
@@ -1284,11 +1315,10 @@ std::pair<int8_t, std::array<std::int32_t, 6> > getDataFromHomeWizard(const char
     const int httpCode = homeWizardHttpClient->GET();
     if (httpCode != HTTP_CODE_OK) {
         _LOG_A("Error on HTTP request (httpCode=%i), url=%s.\n", httpCode, url);
-        homeWizardHttpClient->end(); // Drop this request's socket; keep the client object so we don't churn the heap on every transient error.
-        if (httpCode < 0) {
-            lastMdnsQueryTime = 0; // Force immediate rediscovery on next attempt if the error was a connection failure
-            _LOG_A("Connection failed, allowing immediate rediscovery.\n");
-        }
+        homeWizardHttpClient->end(); // Always cleanup
+        delete homeWizardHttpClient;
+        homeWizardHttpClient = nullptr;
+        homeWizardHttpClientInitialized = false;
         return {false, {0, 0, 0, 0, 0, 0}};
     }
 
@@ -1310,7 +1340,7 @@ std::pair<int8_t, std::array<std::int32_t, 6> > getDataFromHomeWizard(const char
     }
 
     // Stack-allocated JSON document for the parsed response.
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<512> doc;
     const DeserializationError error = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
     homeWizardHttpClient->end();
 
@@ -1608,8 +1638,11 @@ R"EOF(
 )EOF";
 
 
-// Maximum concurrent HTTP connections to prevent socket exhaustion
-#define MAX_HTTP_CONNECTIONS 8
+// Maximum concurrent HTTP connections to prevent socket exhaustion.
+// The ESP32 lwIP stack only has CONFIG_LWIP_MAX_SOCKETS (16) sockets total,
+// shared by EVERYTHING (both HTTP listeners, both MQTT clients, mDNS, SNTP,
+// and the RemoteDebug telnet listener/client).
+#define MAX_HTTP_CONNECTIONS 4
 #define WS_CONNECTION_RESERVE 1
 
 // Count only accepted inbound server connections.
@@ -2088,20 +2121,25 @@ bool NetworkConnected(void) {
 static bool servicesStarted = false;
 
 // Start network services (HTTP, MQTT, mDNS, SNTP, RemoteDebug).
-// Safe to call multiple times — only starts services once.
+// Safe to call multiple times — the HTTP listeners are (re)tried every call
+// (in case an earlier bind failed, e.g. transient socket exhaustion), while
+// the one-time-only steps below are still guarded by servicesStarted.
 static void startNetworkServices(void) {
-    if (servicesStarted) return;
-    servicesStarted = true;
     mg_log_set(MG_LL_NONE);
 
     // Start HTTP listeners (bind to 0.0.0.0 — works on all interfaces)
     if (!HttpListener80) {
         HttpListener80 = mg_http_listen(&mgr, "http://0.0.0.0:80", fn_http_server, NULL);
+        if (!HttpListener80) _LOG_A("ERROR: Failed to start HTTP listener on port 80\n");
     }
     if (!HttpListener443) {
         HttpListener443 = mg_http_listen(&mgr, "http://0.0.0.0:443", fn_http_server, (void *)1);
+        if (!HttpListener443) _LOG_A("ERROR: Failed to start HTTP listener on port 443\n");
     }
-    _LOG_A("HTTP server started\n");
+    if (HttpListener80 || HttpListener443) _LOG_A("HTTP server started\n");
+
+    if (servicesStarted) return;
+    servicesStarted = true;
 
 #if MQTT
 #if MQTT_ESP == 0
@@ -2128,7 +2166,6 @@ static void startNetworkServices(void) {
 // Can be called from both WiFi and Ethernet got-IP events.
 void onGotIP(const char *dns_ip) {
     clearmDNSServices();
-    lastMdnsQueryTime = 0;
 
     // Load DHCP DNS into mongoose
     static char dns4url[] = "udp://123.123.123.123:53";
@@ -2173,6 +2210,7 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
             _LOG_A("Connected or reconnected to WiFi\n");
             break;
         case WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        case WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_LOST_IP:
             if (WIFImode == 1) {
 #if MQTT
                 //mg_timer_free(&mgr);
@@ -2192,7 +2230,9 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
             WiFi.begin((char*)ssid, (char *)password);
         }
         break;
-        default: break;                                                         // prevent compiler warnings
+        default: 
+            _LOG_A("WiFi Event: %d (not handled!)\n", event);
+        break;                                                         // prevent compiler warnings
   }
 }
 
@@ -2434,7 +2474,7 @@ void network_loop() {
 
     mg_mgr_poll(&mgr, 100);                                                     // TODO increase this parameter to up to 1000 to make loop() less greedy
 
-    if (NetworkConnected() && getmDNSServiceCount() == 0 &&
+    if (NetworkConnected() && !mdnsDiscoveryHasRun &&
             (MainsMeter.Type == EM_HOMEWIZARD ||
              EVMeter.Type == EM_HOMEWIZARD ||
              CircuitMeter.Type == EM_HOMEWIZARD)) {
